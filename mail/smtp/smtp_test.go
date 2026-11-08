@@ -2,6 +2,7 @@ package smtp_test
 
 import (
 	"bufio"
+	"crypto/tls"
 	"net"
 	"strings"
 	"sync"
@@ -251,4 +252,96 @@ type welcome struct{}
 func (welcome) Via(notification.Notifiable) []string { return []string{"mail"} }
 func (welcome) ToMail(notification.Notifiable) (*mail.Message, error) {
 	return mail.NewMessage().Subject("Welcome").Line("Welcome aboard"), nil
+}
+
+func TestOptions(t *testing.T) {
+	for name, opts := range map[string][]smtp.Option{
+		"opportunistic with TLS config": {smtp.WithTLS(smtp.TLSOpportunistic), smtp.WithTLSConfig(&tls.Config{MinVersion: tls.VersionTLS12})},
+		"mandatory with server name":    {smtp.WithTLSConfig(&tls.Config{ServerName: "mx.example.test", MinVersion: tls.VersionTLS12})},
+		"forced mechanism":              {smtp.WithAuth("u", "p"), smtp.WithAuthMechanism(smtp.AuthPlain)},
+		"nil option":                    {nil},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := smtp.New("smtp.example.test", opts...); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+	if _, err := smtp.New(""); err == nil {
+		t.Error("an empty host should fail")
+	}
+}
+
+func TestSendOpportunisticWithoutSTARTTLS(t *testing.T) {
+	s := newFakeServer(t)
+	tr, err := smtp.New("127.0.0.1", smtp.WithPort(s.port()), smtp.WithTLS(smtp.TLSOpportunistic),
+		smtp.WithTLSConfig(&tls.Config{MinVersion: tls.VersionTLS12}), smtp.WithTimeout(5*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := email()
+	e.Cc, e.Bcc, e.ReplyTo, e.Attachments = nil, nil, nil, nil
+	if err := tr.Send(t.Context(), e); err != nil {
+		t.Fatalf("opportunistic TLS should fall back to plain text: %v", err)
+	}
+}
+
+func TestSendMandatoryTLSWithoutSTARTTLS(t *testing.T) {
+	s := newFakeServer(t)
+	tr, err := smtp.New("127.0.0.1", smtp.WithPort(s.port()), smtp.WithTimeout(5*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tr.Send(t.Context(), email()); err == nil {
+		t.Fatal("mandatory TLS must refuse a server without STARTTLS")
+	}
+}
+
+func TestSendSingleBody(t *testing.T) {
+	for name, tc := range map[string]struct {
+		html, text, want, notWant string
+	}{
+		"html only": {html: "<p>Hi</p>", want: "text/html", notWant: "multipart/alternative"},
+		"text only": {text: "Hi", want: "text/plain", notWant: "text/html"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			s := newFakeServer(t)
+			e := email()
+			e.Cc, e.Bcc, e.ReplyTo, e.Attachments = nil, nil, nil, nil
+			e.HTML, e.Text = tc.html, tc.text
+			if err := transport(t, s).Send(t.Context(), e); err != nil {
+				t.Fatal(err)
+			}
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			if !strings.Contains(s.data, tc.want) || strings.Contains(s.data, tc.notWant) {
+				t.Errorf("message should contain %q and not %q:\n%s", tc.want, tc.notWant, s.data)
+			}
+		})
+	}
+}
+
+func TestSendInvalidAddresses(t *testing.T) {
+	bad := mail.Address{Email: "not an address"}
+	for name, mutate := range map[string]func(*mail.Email){
+		"from":     func(e *mail.Email) { e.From = bad },
+		"to":       func(e *mail.Email) { e.To = []mail.Address{bad} },
+		"cc":       func(e *mail.Email) { e.Cc = []mail.Address{bad} },
+		"bcc":      func(e *mail.Email) { e.Bcc = []mail.Address{bad} },
+		"reply-to": func(e *mail.Email) { e.ReplyTo = []mail.Address{bad} },
+	} {
+		t.Run(name, func(t *testing.T) {
+			e := email()
+			mutate(e)
+			// No server: the message must be rejected before connecting.
+			tr, err := smtp.New("127.0.0.1", smtp.WithPort(1), smtp.WithTLS(smtp.TLSNone))
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = tr.Send(t.Context(), e)
+			if err == nil || !notification.IsPermanent(err) || !strings.Contains(err.Error(), "smtp: "+name) {
+				t.Fatalf("err = %v", err)
+			}
+		})
+	}
 }

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	notification "github.com/zahansafallwa1511/go-notification"
@@ -78,5 +79,65 @@ func TestMissingSender(t *testing.T) {
 	err := vonage.New("k", "s").Send(t.Context(), sms.SMS{To: "1", Body: "x"})
 	if err == nil || !notification.IsPermanent(err) {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestCallbackAndHTTPClient(t *testing.T) {
+	var got map[string]string
+	srv := server(t, `{"messages":[{"status":"0"}]}`, &got)
+	long := strings.Repeat("x", 150)
+	p := vonage.New("k", "s", nil, vonage.WithBaseURL(srv.URL+"/"), vonage.WithHTTPClient(srv.Client()), vonage.WithCallback("https://acme.test/dlr"))
+
+	if err := p.Send(t.Context(), sms.SMS{To: "1", From: "A", Body: "x", ID: long}); err != nil {
+		t.Fatal(err)
+	}
+	if got["callback"] != "https://acme.test/dlr" || got["status-report-req"] != "1" {
+		t.Errorf("callback = %q, status-report-req = %q", got["callback"], got["status-report-req"])
+	}
+	if got["client-ref"] != long[:100] {
+		t.Errorf("client-ref has %d characters, want 100", len(got["client-ref"]))
+	}
+	if _, ok := got["type"]; ok {
+		t.Error("type must be omitted for non-unicode messages")
+	}
+}
+
+func TestMissingRecipient(t *testing.T) {
+	err := vonage.New("k", "s").Send(t.Context(), sms.SMS{From: "A", Body: "x"})
+	if err == nil || !notification.IsPermanent(err) {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestEmptyResponse(t *testing.T) {
+	srv := server(t, `{"messages":[]}`, nil)
+	err := vonage.New("k", "s", vonage.WithBaseURL(srv.URL)).Send(t.Context(), sms.SMS{To: "1", From: "A", Body: "x"})
+	if err == nil || notification.IsPermanent(err) {
+		t.Fatalf("an empty status list should be a retryable error, got %v", err)
+	}
+}
+
+func TestHTTPFailure(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "down", http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(srv.Close)
+	err := vonage.New("k", "s", vonage.WithBaseURL(srv.URL)).Send(t.Context(), sms.SMS{To: "1", From: "A", Body: "x"})
+	var herr *notification.HTTPError
+	if !errors.As(err, &herr) || herr.StatusCode != http.StatusServiceUnavailable || notification.IsPermanent(err) {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestErrorString(t *testing.T) {
+	err := &vonage.Error{Status: "15", Text: "Illegal Sender Address"}
+	if got, want := err.Error(), "vonage: status 15: Illegal Sender Address"; got != want {
+		t.Errorf("Error() = %q, want %q", got, want)
+	}
+	if err.Temporary() {
+		t.Error("status 15 should not be temporary")
+	}
+	if !(&vonage.Error{Status: "5"}).Temporary() {
+		t.Error("status 5 should be temporary")
 	}
 }
