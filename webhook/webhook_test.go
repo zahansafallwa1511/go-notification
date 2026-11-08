@@ -2,6 +2,7 @@ package webhook_test
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"io"
 	"net/http"
@@ -41,8 +42,10 @@ func server(t *testing.T, status int) (*httptest.Server, *captured) {
 	t.Helper()
 	c := &captured{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		c.req = r
 		c.body, _ = io.ReadAll(r.Body)
+		// Keep a copy: the server still uses r after the handler returns, so
+		// tests must not read or modify the original.
+		c.req = r.Clone(context.WithoutCancel(r.Context()))
 		w.WriteHeader(status)
 		_, _ = w.Write([]byte("response body"))
 	}))
