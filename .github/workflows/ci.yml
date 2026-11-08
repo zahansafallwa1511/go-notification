@@ -1,0 +1,102 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test (Go ${{ matrix.go }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        go: ['1.25']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+      - name: Build
+        run: go build ./...
+      - name: Test core and built-in channels
+        run: go test -race -count=1 ./...
+      - name: Test SMTP transport
+        working-directory: mail/smtp
+        run: go test -race -count=1 ./...
+      - name: Test SES transport
+        working-directory: mail/ses
+        run: go test -race -count=1 ./...
+
+  integration:
+    name: Integration (Postgres, MySQL, SQLite)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: notify
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s --health-timeout 3s --health-retries 10
+      mysql:
+        image: mysql:8
+        env:
+          MYSQL_ROOT_PASSWORD: notify
+          MYSQL_DATABASE: notify
+        ports: ['3306:3306']
+        options: >-
+          --health-cmd "mysqladmin ping -uroot -pnotify"
+          --health-interval 5s --health-timeout 3s --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+      - name: SQL store against SQLite, Postgres and MySQL
+        working-directory: sqltest
+        env:
+          POSTGRES_DSN: postgres://postgres:notify@localhost:5432/postgres?sslmode=disable
+          MYSQL_DSN: root:notify@tcp(localhost:3306)/notify?parseTime=true
+        run: go test -race -count=1 ./...
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+      - name: Check gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files need gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+      - name: go vet
+        run: go vet ./...
+      - name: Core module has no dependencies
+        run: |
+          if grep -q '^require' go.mod; then
+            echo "The core module must not require third-party modules."
+            echo "Put adapters that need one in their own module (see mail/smtp)."
+            exit 1
+          fi
+      - name: Check go mod tidy
+        run: |
+          for dir in . mail/smtp mail/ses sqltest; do
+            (cd "$dir" && go mod tidy)
+          done
+          git diff --exit-code -- '**/go.mod' '**/go.sum' go.mod
+      - uses: golangci/golangci-lint-action@v9
+        with:
+          version: latest
